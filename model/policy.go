@@ -300,40 +300,39 @@ func (model Model) UpdatePolicy(sec string, ptype string, oldRule []string, newR
 
 // UpdatePolicies updates a policy rule from the model.
 func (model Model) UpdatePolicies(sec string, ptype string, oldRules, newRules [][]string) (bool, error) {
-	_, err := model.GetAssertion(sec, ptype)
+	assertion, err := model.GetAssertion(sec, ptype)
 	if err != nil {
 		return false, err
 	}
-	rollbackFlag := false
-	// index -> []{oldIndex, newIndex}
-	modifiedRuleIndex := make(map[int][]int)
-	// rollback
-	defer func() {
-		if rollbackFlag {
-			for index, oldNewIndex := range modifiedRuleIndex {
-				model[sec][ptype].Policy[index] = oldRules[oldNewIndex[0]]
-				oldPolicy := strings.Join(oldRules[oldNewIndex[0]], DefaultSep)
-				newPolicy := strings.Join(newRules[oldNewIndex[1]], DefaultSep)
-				delete(model[sec][ptype].PolicyMap, newPolicy)
-				model[sec][ptype].PolicyMap[oldPolicy] = index
-			}
-		}
-	}()
 
-	newIndex := 0
-	for oldIndex, oldRule := range oldRules {
-		oldPolicy := strings.Join(oldRule, DefaultSep)
-		index, ok := model[sec][ptype].PolicyMap[oldPolicy]
-		if !ok {
-			rollbackFlag = true
+	// Every index has to be resolved before the first write. Looking an old rule
+	// up in the same map this call is rewriting returns a stale index as soon as
+	// a batch permutes its rules: once oldRules[0] has taken the entry that
+	// newRules[0] is keyed by, the lookup for the next old rule lands on the row
+	// that was just overwritten, so the batch rewrites rows it already rewrote
+	// and deletes a key that no longer names any row. The slice then keeps its
+	// old rules while PolicyMap loses them, and a rule still returned by
+	// GetPolicy stops being findable by HasPolicy, RemovePolicy and UpdatePolicy.
+	indexes := make([]int, len(oldRules))
+	used := make(map[int]bool, len(oldRules))
+	for i, oldRule := range oldRules {
+		index, ok := assertion.PolicyMap[strings.Join(oldRule, DefaultSep)]
+		if !ok || used[index] {
 			return false, nil
 		}
+		used[index] = true
+		indexes[i] = index
+	}
 
-		model[sec][ptype].Policy[index] = newRules[newIndex]
-		delete(model[sec][ptype].PolicyMap, oldPolicy)
-		model[sec][ptype].PolicyMap[strings.Join(newRules[newIndex], DefaultSep)] = index
-		modifiedRuleIndex[index] = []int{oldIndex, newIndex}
-		newIndex++
+	for i, oldRule := range oldRules {
+		assertion.Policy[indexes[i]] = newRules[i]
+		delete(assertion.PolicyMap, strings.Join(oldRule, DefaultSep))
+	}
+
+	// The new keys go in only after every old key is gone, because a permuted
+	// batch has newRules entries that are still keyed as oldRules.
+	for i, newRule := range newRules {
+		assertion.PolicyMap[strings.Join(newRule, DefaultSep)] = indexes[i]
 	}
 
 	return true, nil
