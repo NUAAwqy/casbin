@@ -18,7 +18,10 @@
 package persist_test
 
 import (
+	"os"
+	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/casbin/casbin/v3"
@@ -150,5 +153,139 @@ m = r.sub == p.sub && r.obj == p.obj && r.act == p.act
 	}
 	if !reflect.DeepEqual(rules[0], rule) {
 		t.Errorf("rule after round-trip: %q, expected %q (line: %q)", rules[0], rule, line)
+	}
+}
+
+// A policy file keeps one rule per line and the adapters hand LoadPolicyLine one
+// physical line at a time, so a field containing a line break has no encoding
+// that can be read back. PolicyLineToCsv must say so instead of returning a
+// "line" that spans several physical lines.
+func TestPolicyLineToCsvLineBreaks(t *testing.T) {
+	tests := []struct {
+		name    string
+		ptype   string
+		rule    []string
+		wantErr bool
+	}{
+		{
+			name:    "field containing a line break",
+			ptype:   "p",
+			rule:    []string{"alice", "first\nsecond", "read"},
+			wantErr: true,
+		},
+		{
+			name:    "field containing a carriage return and a line break",
+			ptype:   "p",
+			rule:    []string{"alice", "first\r\nsecond", "read"},
+			wantErr: true,
+		},
+		{
+			// A lone carriage return leaves the rule on one physical line, so
+			// LoadPolicyLine can still read it back.
+			name:  "field containing a lone carriage return",
+			ptype: "p",
+			rule:  []string{"alice", "first\rsecond", "read"},
+		},
+		{
+			name:  "fields that need quoting still work",
+			ptype: "p",
+			rule:  []string{"alice", "data1", "read", "r.attrs in ('val1','val2')"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			line, err := persist.PolicyLineToCsv(tt.ptype, tt.rule)
+			if tt.wantErr {
+				if err != nil {
+					return
+				}
+				if strings.Contains(line, "\n") {
+					t.Fatalf("PolicyLineToCsv returned the multi-line %q for rule %q, "+
+						"a policy file cannot store it", line, tt.rule)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("PolicyLineToCsv: %v", err)
+			}
+			if strings.Contains(line, "\n") {
+				t.Errorf("line: %q, expected a single physical line", line)
+			}
+		})
+	}
+}
+
+// The corruption is only visible in the saved file: an unreadable policy file is
+// written and the rules behind it are lost on the next start.
+func TestSavePolicyWithLineBreakRule(t *testing.T) {
+	conf := `
+[request_definition]
+r = sub, obj, act
+
+[policy_definition]
+p = sub, obj, act
+
+[policy_effect]
+e = some(where (p.eft == allow))
+
+[matchers]
+m = r.sub == p.sub && r.obj == p.obj && r.act == p.act
+`
+	dir := t.TempDir()
+	confPath := filepath.Join(dir, "model.conf")
+	policyPath := filepath.Join(dir, "policy.csv")
+	if err := os.WriteFile(confPath, []byte(conf), 0o600); err != nil {
+		t.Fatalf("write model: %v", err)
+	}
+	original := "p, alice, data1, read\n"
+	if err := os.WriteFile(policyPath, []byte(original), 0o600); err != nil {
+		t.Fatalf("write policy: %v", err)
+	}
+
+	e, err := casbin.NewEnforcer(confPath, policyPath)
+	if err != nil {
+		t.Fatalf("new enforcer: %v", err)
+	}
+	rule := []string{"bob", "first\nsecond", "write"}
+	if _, err = e.AddPolicy(rule[0], rule[1], rule[2]); err != nil {
+		t.Fatalf("AddPolicy: %v", err)
+	}
+
+	saveErr := e.SavePolicy()
+	saved, err := os.ReadFile(policyPath)
+	if err != nil {
+		t.Fatalf("read policy: %v", err)
+	}
+	if saveErr != nil {
+		if string(saved) != original {
+			t.Errorf("policy file after the failed save: %q, expected it untouched at %q", saved, original)
+		}
+		_, err = casbin.NewEnforcer(confPath, policyPath)
+		if err != nil {
+			t.Errorf("the untouched policy file must still load: %v", err)
+		}
+		return
+	}
+
+	reloaded, err := casbin.NewEnforcer(confPath, policyPath)
+	if err != nil {
+		t.Fatalf("SavePolicy wrote %q, which cannot be loaded back: %v", saved, err)
+	}
+	got, err := reloaded.GetPolicy()
+	if err != nil {
+		t.Fatalf("GetPolicy: %v", err)
+	}
+	for _, want := range [][]string{{"alice", "data1", "read"}, rule} {
+		found := false
+		for _, g := range got {
+			if reflect.DeepEqual(g, want) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("rule %q is gone after save and reload, got %q (file: %q)", want, got, saved)
+		}
 	}
 }

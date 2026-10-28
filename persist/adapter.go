@@ -21,6 +21,7 @@ import (
 	"bytes"
 	"encoding/csv"
 	"errors"
+	"fmt"
 	"strings"
 
 	"github.com/casbin/casbin/v3/model"
@@ -50,6 +51,11 @@ func LoadPolicyLine(line string, m model.Model) error {
 // files, which LoadPolicyLine accepts because its reader trims leading spaces.
 // Fields containing commas are properly quoted so the line can be round-tripped
 // through LoadPolicyLine without corruption.
+//
+// A field containing a line break cannot be represented: a policy file stores one
+// rule per line and the adapters feed LoadPolicyLine a single line at a time, so
+// the quoted line break would end the rule early and the rest of it would be read
+// as a separate, malformed line. Such a field is rejected instead of written.
 func PolicyLineToCsv(ptype string, rule []string) (string, error) {
 	record := append([]string{ptype}, rule...)
 
@@ -59,6 +65,10 @@ func PolicyLineToCsv(ptype string, rule []string) (string, error) {
 	w := csv.NewWriter(&buf)
 	fields := make([]string, 0, len(record))
 	for _, field := range record {
+		if strings.ContainsRune(field, '\n') {
+			return "", fmt.Errorf("invalid policy field %q: a policy file holds one rule per line, so a field cannot contain a line break", field)
+		}
+
 		buf.Reset()
 		if err := w.Write([]string{field}); err != nil {
 			return "", err
